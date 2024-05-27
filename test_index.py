@@ -1,21 +1,52 @@
+from PIL import Image
 from glob import glob
 from clize import run
 import os
 from pathlib import Path
-import pandas as pd
 import torch
 import faiss
-import torch.nn.functional as F
 import numpy as np
 import joblib
-from subprocess import call
-from clip_benchmark.datasets.builder import (
-    build_dataset,
-    get_dataset_collate_fn,
-    get_zeroshot_classification_templates,
-)
-from clip_benchmark.metrics import zeroshot_classification, zeroshot_retrieval
-from eval_copy_detection import load_model_and_transform, extract_features_batch
+from isc_feature_extractor import create_model
+import webdataset as wds
+from compute_embeddings import log_and_continue
+import tarfile
+from tqdm import tqdm
+
+
+def extract_file_from_tar(tar_path: str, file_name: str,
+                          dest_folder: str, save_file_name: str = None) -> None:
+    """
+    Extracts a specific file from a tar archive and saves it to the designated folder.
+
+    Args:
+        tar_path (str): The path to the tar archive.
+        file_name (str): The name of the file to extract from the tar archive.
+        dest_folder (str): The folder where the extracted file will be saved.
+        save_file_name (str): The name of the file to be saved in the dest_folder.
+        defaults to None. if no value was provided file_name will be used.
+
+
+    Returns:
+        None
+    """
+    tar_path = Path(tar_path)
+    dest_folder = Path(dest_folder)
+
+    # Ensure destination folder exists
+    dest_folder.mkdir(parents=True, exist_ok=True)
+
+    with tarfile.open(tar_path, 'r') as tar:
+        # Extract the specified file
+        member = tar.getmember(file_name)
+        tar.extract(member, dest_folder)
+
+        # Move the extracted file to the root of the destination folder
+        if save_file_name is not None:
+            extracted_path = dest_folder / member.name
+            final_path = dest_folder / Path(save_file_name)
+            extracted_path.rename(final_path)
+
 
 class MetaData:
 
@@ -28,7 +59,7 @@ class MetaData:
         for path in self.paths:
             data = np.load(path, allow_pickle=True)
             self.sizes.append(len(data))
-    
+
     def get_indices(self, indices):
         return [self.get(ind) for ind in indices]
 
@@ -42,19 +73,19 @@ class MetaData:
         # avg = self.cumsum[-1] / len(self.cumsum)
         # pos = int(index // avg)
         # while pos < len(self.cumsum) and pos >= 0:
-            # start = 0 if pos == 0 else self.cumsum[pos-1]
-            # end = self.cumsum[pos]
-            # print(index, pos, start, end)
-            # # print(pos, start, end, index)
-            # if start <= index < end:
-                # path = self.paths[pos]
-                # data = np.load(path, allow_pickle=True)
-                # offset = index - start
-                # return data[offset]
-            # elif index < start:
-                # pos -= 1
-            # else:
-                # pos += 1
+        # start = 0 if pos == 0 else self.cumsum[pos-1]
+        # end = self.cumsum[pos]
+        # print(index, pos, start, end)
+        # # print(pos, start, end, index)
+        # if start <= index < end:
+        # path = self.paths[pos]
+        # data = np.load(path, allow_pickle=True)
+        # offset = index - start
+        # return data[offset]
+        # elif index < start:
+        # pos -= 1
+        # else:
+        # pos += 1
         # raise ValueError()
         # nb = 0
         start = 0
@@ -66,11 +97,9 @@ class MetaData:
                 return data[offset]
             start = end
 
-from functools import partial
-from PIL import Image
 
 def expand2square(pil_img, background_color):
-    #https://note.nkmk.me/en/python-pillow-add-margin-expand-canvas/
+    # https://note.nkmk.me/en/python-pillow-add-margin-expand-canvas/
     width, height = pil_img.size
     if width == height:
         return pil_img
@@ -83,28 +112,30 @@ def expand2square(pil_img, background_color):
         result.paste(pil_img, ((height - width) // 2, 0))
         return result
 
+
 def resize(image, tf):
     # image = image.resize((256, 256), Image.LANCZOS)
     # image = expand2square(image, (255, 255, 255))
-    image =  tf(image)
+    image = tf(image)
     return image
+
 
 @torch.no_grad()
 def main(
     *,
-    dataset_name="cifar10",
+    dataset_name="Laion_tar_2",
     root="root",
-    cosine_similarity_threshold=0.94,
+    cosine_similarity_threshold=0.604169,
     split="test",
-    index="indexes/seer_1.5B/knn.index",
-    metadata="embeddings/seer_1.5B/meta",
+    index="/output/index/knn.index",
+    metadata="/output/meta",
     batch_size=128,
     num_workers=4,
     model_config="dedup_seer1.5B.th",
-    out="out",
+    out="/output/results/exp_2_t_0_604169",
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dataset_slug = dataset_name.replace("/", "_")
+    # dataset_slug = dataset_name.replace("/", "_")
 
     # Load metadata and index
     print("Loading metadata and index...")
@@ -114,94 +145,140 @@ def main(
         joblib.dump(metadata, os.path.join(os.path.dirname(index), "meta.pkl"))
     else:
         metadata = joblib.load(metadata)
-    
+
     # metadata.cumsum = np.cumsum(metadata.sizes)
     start = 0
     metadata.path_index = []
     for i, size in enumerate(metadata.sizes):
         end = start + size
-        metadata.path_index.extend( [(start, end, i)] * size  )
+        metadata.path_index.extend([(start, end, i)] * size)
         start = end
 
     image_index = faiss.read_index(index)
-    model_config_name = model_config
-    model_config = torch.load(model_config_name, map_location="cpu")
-    model, transform = load_model_and_transform(model_config)
-    if device == "cuda":
-        model_config.pca.to_cuda()
+    weight_name = 'isc_ft_v107'
+    model, preprocessor = create_model(
+        weight_name=weight_name,
+        device='cuda', model_dir="/weights")
     model = model.to(device)
     model.eval()
-    
-    # Build dataset/dataloader
-    ds = build_dataset(
-        dataset_name=dataset_name,
-        root=root,
-        download=True,
-        split=split,
-        transform=partial(resize, tf=transform),
-    )
-    collate_fn = get_dataset_collate_fn(dataset_name)
-    dl = torch.utils.data.DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-    )
-    features_cache = os.path.join(out, f"{dataset_name.replace('/','_')}_{index.replace('/','_')}_{model_config_name.replace('/', '_')}.npy")
-    print(features_cache)
-    if os.path.exists(features_cache):
-        print("loading cached features...")
-        image_features = np.load(features_cache)
-    else:
-        # Compute image features
-        image_features_list = []
-        print("Computing image features...")
-        for X, Y in dl:
-            X = X.to(device)
-            image_features = extract_features_batch(model, X, model_config)
-            image_features = image_features.data.cpu()
-            image_features = image_features.view(len(image_features), -1)
-            image_features_list.append(image_features)
-        image_features = np.concatenate(image_features_list)
-        np.save(features_cache, image_features)
+    # if device == "cuda":
+    #     model_config.pca.to_cuda()
+    # model = model.to(device)
+    # model.eval()
 
-    # Get embeddings from indexed data (i.e., LAION) that are close to the 
+    # Build dataset/dataloader
+
+    data_list = map(
+        str, Path("/data/").resolve().glob("*.tar"))
+    pipeline = [wds.SimpleShardList(data_list)]
+    pipeline.extend([
+        wds.split_by_node,
+        wds.split_by_worker,
+        wds.tarfile_to_samples(handler=log_and_continue),
+    ])
+    pipeline.extend([
+        wds.decode("pilrgb", handler=log_and_continue),
+        wds.rename(image="jpg;png"),
+        wds.map_dict(image=preprocessor),
+        wds.to_tuple("image", "json"),
+        wds.batched(8, partial=False),
+    ])
+    dataset = wds.DataPipeline(*pipeline)
+    ds = wds.WebLoader(
+        dataset,
+        batch_size=None,
+        shuffle=False,
+        num_workers=8,
+    )
+    features_cache = os.path.join(
+        out, f"{dataset_name.replace('/','_')}_{index.replace('/','_')}_{weight_name.replace('/', '_')}.npy")
+    meta_cache = os.path.join(
+        out, f"{dataset_name.replace('/','_')}_{index.replace('/','_')}_{weight_name.replace('/', '_')}_meta.npy")
+    print(features_cache)
+    print(meta_cache)
+    # create the folder if doesn't exists.
+    Path(features_cache).resolve().parent.mkdir(parents=True, exist_ok=True)
+    # if os.path.exists(features_cache) and os.path.exists(meta_cache):
+    #     print("loading cached features...")
+    #     image_features = np.load(features_cache)
+    #     meta_features = np.load(meta_cache)
+
+    # else:
+    # Compute image features
+    image_features_list = []
+    meta_features = []
+    # count = 0
+    print("Computing image features...")
+    for X, meta in ds:
+        file_meta = [{"tar_file": f"/data/{x['key'][:-4]}.tar",
+                      "file_name": f"{x['key']}.jpg"} for x in meta]
+        X = X.to(device)
+        # image_features = extract_features_batch(model, X, model_config)
+        image_features = model(X)
+        image_features = image_features.data.cpu()
+        image_features = image_features.view(len(image_features), -1)
+        image_features_list.append(image_features)
+        meta_features.append(file_meta)
+        # count += 1
+        # if count > 8:
+        break
+    image_features = np.concatenate(image_features_list)
+
+    print("image_Features shape:", image_features.shape)
+    np.save(features_cache, image_features)
+    np.save(meta_cache, meta_features)
+
+    # Get embeddings from indexed data (i.e., LAION) that are close to the
     # image embeddings of the dataset
-    print(len(image_features))
+    # print(len(image_features))
     print("Performing range search...")
     # image_features = image_features[30_000:40_000]
-    D, I = image_index.search(image_features, 1)
+    D, I_ = image_index.search(image_features, 1)
     print("Score:", D.mean())
-    L, D, I = image_index.range_search(image_features, cosine_similarity_threshold)
-    ds.transform = None
-    ds.transforms = None
-    print(ds[0][0])
-    print(ds[0][1])
+    L, D, I_ = image_index.range_search(
+        image_features, cosine_similarity_threshold)
+    # ds.transform = None
+    # ds.transforms = None
+    # print(ds[0][0])
+    # print(ds[0][1])
     i = 0
-    nb = 0
+    # nb = 0
     assert len(L) - 1 == len(image_features)
     print("Start..")
-    for i in range(len(L) - 1):
-        indices = I[L[i] : L[i + 1]]
-        dists = D[L[i] : L[i + 1]]
+    for i in tqdm(range(len(L) - 1)):
+        indices = I_[L[i]: L[i + 1]]
+        dists = D[L[i]: L[i + 1]]
         if len(indices):
             # indices = indices[0:10]
             # dists = dists[0:10]
             order = np.argsort(-dists)
             indices = indices[order][0:10]
             dists = dists[order][0:10]
-            print(dists)
-            folder = os.path.join(out, str(i))
-            os.makedirs(folder, exist_ok=True)
-            ds[i][0].save(f"{folder}/actual.jpg")
-            df = pd.DataFrame(metadata.get_indices(indices))
-            df = df[["url"]]
-            df["distance"] = dists
-            df.to_csv(f"{folder}/dup.csv", index=False)
-            url = df.url.values[0]
-            nb += 1
-            print(nb, len(ds))
-        print(i)
+            # print(dists)
+            file_meta = meta_features[0][i]
+            folder = os.path.join(out, str(Path(file_meta["file_name"]).stem))
+            # extract the original image
+            extract_file_from_tar(tar_path=file_meta["tar_file"],
+                                  file_name=file_meta["file_name"],
+                                  dest_folder=folder,
+                                  save_file_name="query_image.jpg",)
+            # get all the similar images.
+            meta_files = metadata.get_indices(indices)
+            for file_meta, dis in enumerate(meta_files, dists):
+                extract_file_from_tar(tar_path=file_meta["tar_file"],
+                                      file_name=file_meta["file_name"],
+                                      dest_folder=folder)
+
+        #     ds[i][0].save(f"{folder}/actual.jpg")
+        #     df = pd.DataFrame(metadata.get_indices(indices))
+        #     df = df[["url"]]
+        #     df["distance"] = dists
+        #     df.to_csv(f"{folder}/dup.csv", index=False)
+        #     # url = df.url.values[0]
+        #     nb += 1
+        #     print(nb, len(ds))
+        # print(i)
+
+
 if __name__ == "__main__":
     run(main)

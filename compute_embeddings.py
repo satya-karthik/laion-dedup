@@ -1,11 +1,14 @@
+# TODO: fix the imports
 import time
 from functools import partial
 import os
 import argparse
+from pathlib import Path
 import sys
 import json
 import torch
 import torch.nn.functional as F
+from isc_feature_extractor import create_model
 import torchvision
 import numpy as np
 import logging
@@ -32,6 +35,8 @@ except ImportError:
     has_huggingface = False
 
 from eval_copy_detection import load_model_and_transform, extract_features_batch
+from tqdm import tqdm
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -46,17 +51,21 @@ def main():
     parser.add_argument('--out_format', type=str, default="npy")
     parser.add_argument('--batches_per_chunk', type=int, default=100)
     parser.add_argument('--run_id', type=int, default=0)
-    parser.add_argument('--verbose', default=False, action="store_true", help="verbose mode")
-    parser.add_argument('--distributed', default=False, action="store_true", help="distributed mode")
+    parser.add_argument('--verbose', default=False,
+                        action="store_true", help="verbose mode")
+    parser.add_argument('--distributed', default=False,
+                        action="store_true", help="distributed mode")
     parser.add_argument('--dist_env', type=str, default="env://")
     parser.add_argument('--dist_backend', type=str, default="nccl")
     args = parser.parse_args()
     run(args)
-   
+
+
 def log_and_continue(exn):
     """Call in an exception handler to ignore any exception, isssue a warning, and continue."""
     logging.warning(f'Handling webdataset error ({repr(exn)}). Ignoring.')
     return True
+
 
 def world_info_from_env():
     # from https://github.com/mlfoundations/open_clip/blob/1c8647f14ff1f826b9096962777e39f7c5cd4ba9/src/training/distributed.py
@@ -78,7 +87,8 @@ def world_info_from_env():
             break
 
     return local_rank, global_rank, world_size
- 
+
+
 def run(args):
     if args.distributed:
         import utils
@@ -89,25 +99,30 @@ def run(args):
         rank = 0
         world_size = 1
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     emb_folder = os.path.join(args.out_folder, "emb")
     meta_folder = os.path.join(args.out_folder, "meta")
     if rank == 0:
         os.makedirs(emb_folder, exist_ok=True)
         os.makedirs(meta_folder, exist_ok=True)
     torch.backends.cudnn.benchmark = True
-        
-    model_config = torch.load(args.model_config)
-    model, transform = load_model_and_transform(model_config)
-    if model_config.pca is not None:
-        model_config.pca.to_cuda()
+
+    weight_name = 'isc_ft_v107'
+    model, preprocessor = create_model(
+        weight_name=weight_name,
+        device='cuda', model_dir="/weights")
+    # model_config = torch.load(args.model_config)
+    # model, transform = load_model_and_transform(model_config)
+    # if model_config.pca is not None:
+    #     model_config.pca.to_cuda()
     model = model.to(device)
     model.eval()
-    
+    args.dataset_root = map(
+        str, Path(args.dataset_root).resolve().glob("*.tar"))
     # with torch.no_grad():
-        # sample_input = (torch.randn(64,3,224,224).to(device),)
-        # traced_model = torch.jit.trace(model, sample_input, strict=False)
-        # model = torch.jit.freeze(traced_model)
+    # sample_input = (torch.randn(64,3,224,224).to(device),)
+    # traced_model = torch.jit.trace(model, sample_input, strict=False)
+    # model = torch.jit.freeze(traced_model)
 
     if args.dataset_type == "webdataset":
         assert has_wds
@@ -120,8 +135,8 @@ def run(args):
         pipeline.extend([
             wds.decode("pilrgb", handler=log_and_continue),
             wds.rename(image="jpg;png"),
-            wds.map_dict(image=transform),
-            wds.to_tuple("image","json"),
+            wds.map_dict(image=preprocessor),
+            wds.to_tuple("image", "json"),
             wds.batched(args.batch_size, partial=False),
         ])
         dataset = wds.DataPipeline(*pipeline)
@@ -132,8 +147,10 @@ def run(args):
             num_workers=args.workers,
         )
     elif args.dataset_type == "image_folder":
-        dataset = torchvision.datasets.ImageFolder(args.dataset_root, transform=transform)
-        dataloader = torch.utils.data.DataLoader(dataset, num_workers=args.workers, shuffle=False, batch_size=args.batch_size)
+        dataset = torchvision.datasets.ImageFolder(
+            args.dataset_root, transform=preprocessor)
+        dataloader = torch.utils.data.DataLoader(
+            dataset, num_workers=args.workers, shuffle=False, batch_size=args.batch_size)
     else:
         raise ValueError(args.dataset_type)
 
@@ -142,35 +159,45 @@ def run(args):
     chunk_id = 0
     nb = 0
     t0 = time.time()
-    for X,meta in dataloader:
+    for X, meta in tqdm(dataloader):
+        # print(f"meta type: {type(meta[0])}\nmeta: {meta[0]}")
+        file_meta = [{"tar_file": f"/data/{x['key'][:-4]}.tar",
+                      "file_name": f"{x['key']}.jpg"} for x in meta]
         X = X.to(device)
         with torch.no_grad():
-            features = extract_features_batch(model, X, model_config)
+            # print("extracting features...")
+            features = model(X)
             features = features.data.cpu()
         features = features.view(len(features), -1)
         features = features.numpy()
         features_chunks.append(features)
-        meta_chunks.extend(meta)
+        meta_chunks.extend(file_meta)
         nb += len(X)
         if len(features_chunks) == args.batches_per_chunk:
             features = np.concatenate(features_chunks)
-            np.save(os.path.join(emb_folder, f"{chunk_id}_{rank}_{args.run_id}"), features)
-            np.save(os.path.join(meta_folder, f"{chunk_id}_{rank}_{args.run_id}"), meta_chunks)
+            np.save(os.path.join(
+                emb_folder, f"{chunk_id}_{rank}_{args.run_id}"), features)
+            np.save(os.path.join(meta_folder,
+                    f"{chunk_id}_{rank}_{args.run_id}"), meta_chunks)
             chunk_id += 1
             features_chunks = []
             meta_chunks = []
             if rank == 0:
-                total = nb*world_size
+                total = nb * world_size
                 throughput = total / (time.time() - t0)
-                print(f"Total nb of images processed: {total}. Throughput: {throughput:.2f} images per sec")
+                print(
+                    f"Total nb of images processed: {total}. Throughput: {throughput:.2f} images per sec")
     # final
     if len(features_chunks):
         features = np.concatenate(features_chunks)
-        np.save(os.path.join(emb_folder, f"{chunk_id}_{rank}_{args.run_id}"), features_chunks)
-        np.save(os.path.join(meta_folder, f"{chunk_id}_{rank}_{args.run_id}"), meta_chunks)
+        np.save(os.path.join(
+            emb_folder, f"{chunk_id}_{rank}_{args.run_id}"), features_chunks)
+        np.save(os.path.join(meta_folder,
+                f"{chunk_id}_{rank}_{args.run_id}"), meta_chunks)
     print("Finished")
     if args.distributed:
         dist.barrier()
+
 
 if __name__ == "__main__":
     sys.exit(main())  # pragma: no cover
