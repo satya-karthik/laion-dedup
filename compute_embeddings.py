@@ -1,40 +1,17 @@
-# TODO: fix the imports
-import time
-from functools import partial
 import os
 import argparse
 from pathlib import Path
 import sys
-import json
 import torch
-import torch.nn.functional as F
-from isc_feature_extractor import create_model
+from feature_extractor import create_model
 import torchvision
 import numpy as np
 import logging
-import torch.distributed as dist
 try:
     import webdataset as wds
     has_wds = True
 except ImportError:
     has_wds = False
-
-try:
-    import timm
-    from timm.data import resolve_data_config
-    from timm.data.transforms_factory import create_transform
-    has_timm = True
-except ImportError as ex:
-    has_timm = False
-
-try:
-    import transformers
-    from transformers import AutoFeatureExtractor
-    has_huggingface = True
-except ImportError:
-    has_huggingface = False
-
-from eval_copy_detection import load_model_and_transform, extract_features_batch
 from tqdm import tqdm
 
 
@@ -89,6 +66,57 @@ def world_info_from_env():
     return local_rank, global_rank, world_size
 
 
+def get_dataloader(dataset_type: str, dataset_root: [str],
+                   device: torch.device,
+                   preprocessor: torchvision.transforms.transforms,
+                   batch_size: int = 32, workers: int = 4
+                   ) -> torch.utils.data.DataLoader:
+    """Returns a dataloader for the specified dataset type and root directory.
+
+    Args:
+        dataset_type (str): The type of dataset to load. Can be "webdataset" or "image_folder".
+        device (torch.device): The device on which to load the data.
+        preprocessor (torchvision.transforms.transforms): A torchvision transform pipeline that will be applied to each image.
+        dataset_root (list): The path to the root directory of the dataset.
+        batch_size (int, optional): The batch size for the dataloader. Defaults to 32.
+        workers (int, optional): The number of workers for the dataloader. Defaults to 4.
+
+    Returns:
+        torch.utils.data.DataLoader: A dataloader for the specified dataset.
+    """
+    if dataset_type == "webdataset":
+        assert has_wds
+        pipeline = [wds.SimpleShardList(dataset_root)]
+        pipeline.extend([
+            wds.split_by_node,
+            wds.split_by_worker,
+            wds.tarfile_to_samples(handler=log_and_continue),
+        ])
+        pipeline.extend([
+            wds.decode("pilrgb", handler=log_and_continue),
+            wds.rename(image="jpg;png"),
+            wds.map_dict(image=preprocessor),
+            wds.to_tuple("image", "json"),
+            wds.batched(batch_size, partial=False),
+        ])
+        dataset = wds.DataPipeline(*pipeline)
+        dataloader = wds.WebLoader(
+            dataset,
+            batch_size=None,
+            shuffle=False,
+            num_workers=workers,
+        )
+    elif dataset_type == "image_folder":
+        dataset = torchvision.datasets.ImageFolder(
+            dataset_root, transform=preprocessor)
+        dataloader = torch.utils.data.DataLoader(
+            dataset, num_workers=workers, shuffle=False, batch_size=batch_size)
+    else:
+        raise ValueError(dataset_type)
+
+    return dataloader
+
+
 def run(args):
     if args.distributed:
         import utils
@@ -107,97 +135,44 @@ def run(args):
         os.makedirs(meta_folder, exist_ok=True)
     torch.backends.cudnn.benchmark = True
 
-    weight_name = 'isc_ft_v107'
+    weight_name = 'checkpoint_0009'
     model, preprocessor = create_model(
         weight_name=weight_name,
         device='cuda', model_dir="/weights")
-    # model_config = torch.load(args.model_config)
-    # model, transform = load_model_and_transform(model_config)
-    # if model_config.pca is not None:
-    #     model_config.pca.to_cuda()
+
     model = model.to(device)
     model.eval()
     args.dataset_root = map(
         str, Path(args.dataset_root).resolve().glob("*.tar"))
-    # with torch.no_grad():
-    # sample_input = (torch.randn(64,3,224,224).to(device),)
-    # traced_model = torch.jit.trace(model, sample_input, strict=False)
-    # model = torch.jit.freeze(traced_model)
 
-    if args.dataset_type == "webdataset":
-        assert has_wds
-        pipeline = [wds.SimpleShardList(args.dataset_root)]
-        pipeline.extend([
-            wds.split_by_node,
-            wds.split_by_worker,
-            wds.tarfile_to_samples(handler=log_and_continue),
-        ])
-        pipeline.extend([
-            wds.decode("pilrgb", handler=log_and_continue),
-            wds.rename(image="jpg;png"),
-            wds.map_dict(image=preprocessor),
-            wds.to_tuple("image", "json"),
-            wds.batched(args.batch_size, partial=False),
-        ])
-        dataset = wds.DataPipeline(*pipeline)
-        dataloader = wds.WebLoader(
-            dataset,
-            batch_size=None,
-            shuffle=False,
-            num_workers=args.workers,
-        )
-    elif args.dataset_type == "image_folder":
-        dataset = torchvision.datasets.ImageFolder(
-            args.dataset_root, transform=preprocessor)
-        dataloader = torch.utils.data.DataLoader(
-            dataset, num_workers=args.workers, shuffle=False, batch_size=args.batch_size)
-    else:
-        raise ValueError(args.dataset_type)
+    for dataset_item in args.dataset_root:
+        chuck_name = str(Path(dataset_item).resolve().stem)
+        dataloader = get_dataloader(dataset_type="webdataset",
+                                    dataset_root=[dataset_item], device=device,
+                                    preprocessor=preprocessor)
 
-    features_chunks = []
-    meta_chunks = []
-    chunk_id = 0
-    nb = 0
-    t0 = time.time()
-    for X, meta in tqdm(dataloader):
-        # print(f"meta type: {type(meta[0])}\nmeta: {meta[0]}")
-        file_meta = [{"tar_file": f"/data/{x['key'][:-4]}.tar",
-                      "file_name": f"{x['key']}.jpg"} for x in meta]
-        X = X.to(device)
-        with torch.no_grad():
-            # print("extracting features...")
-            features = model(X)
-            features = features.data.cpu()
-        features = features.view(len(features), -1)
-        features = features.numpy()
-        features_chunks.append(features)
-        meta_chunks.extend(file_meta)
-        nb += len(X)
-        if len(features_chunks) == args.batches_per_chunk:
-            features = np.concatenate(features_chunks)
-            np.save(os.path.join(
-                emb_folder, f"{chunk_id}_{rank}_{args.run_id}"), features)
-            np.save(os.path.join(meta_folder,
-                    f"{chunk_id}_{rank}_{args.run_id}"), meta_chunks)
-            chunk_id += 1
-            features_chunks = []
-            meta_chunks = []
-            if rank == 0:
-                total = nb * world_size
-                throughput = total / (time.time() - t0)
-                print(
-                    f"Total nb of images processed: {total}. Throughput: {throughput:.2f} images per sec")
-    # final
-    if len(features_chunks):
+        features_chunks = []
+        meta_chunks = []
+
+        for X, meta in tqdm(dataloader):
+
+            file_meta = [{"tar_file": f"/data/{x['key'][:-4]}.tar",
+                          "file_name": f"{x['key']}.jpg"} for x in meta]
+            X = X.to(device)
+            with torch.no_grad():
+                features = model(X)
+                features = features.data.cpu()
+            features = features.view(len(features), -1)
+            features = features.numpy()
+            features_chunks.append(features)
+            meta_chunks.extend(file_meta)
+
         features = np.concatenate(features_chunks)
         np.save(os.path.join(
-            emb_folder, f"{chunk_id}_{rank}_{args.run_id}"), features_chunks)
+            emb_folder, f"{chuck_name}"), features)
         np.save(os.path.join(meta_folder,
-                f"{chunk_id}_{rank}_{args.run_id}"), meta_chunks)
-    print("Finished")
-    if args.distributed:
-        dist.barrier()
+                f"{chuck_name}"), meta_chunks)
 
 
 if __name__ == "__main__":
-    sys.exit(main())  # pragma: no cover
+    sys.exit(main())

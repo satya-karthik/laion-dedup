@@ -7,7 +7,7 @@ import torch
 import faiss
 import numpy as np
 import joblib
-from isc_feature_extractor import create_model
+from feature_extractor import create_model
 import webdataset as wds
 from compute_embeddings import log_and_continue
 import tarfile
@@ -114,8 +114,6 @@ def expand2square(pil_img, background_color):
 
 
 def resize(image, tf):
-    # image = image.resize((256, 256), Image.LANCZOS)
-    # image = expand2square(image, (255, 255, 255))
     image = tf(image)
     return image
 
@@ -132,7 +130,7 @@ def main(
     batch_size=128,
     num_workers=4,
     model_config="dedup_seer1.5B.th",
-    out="/output/results/exp_2_t_0_604169",
+    out="/output/results/exp_9_t_0_604169",
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # dataset_slug = dataset_name.replace("/", "_")
@@ -155,18 +153,12 @@ def main(
         start = end
 
     image_index = faiss.read_index(index)
-    weight_name = 'isc_ft_v107'
+    weight_name = 'checkpoint_0009'
     model, preprocessor = create_model(
         weight_name=weight_name,
         device='cuda', model_dir="/weights")
     model = model.to(device)
     model.eval()
-    # if device == "cuda":
-    #     model_config.pca.to_cuda()
-    # model = model.to(device)
-    # model.eval()
-
-    # Build dataset/dataloader
 
     data_list = map(
         str, Path("/data/").resolve().glob("*.tar"))
@@ -181,7 +173,7 @@ def main(
         wds.rename(image="jpg;png"),
         wds.map_dict(image=preprocessor),
         wds.to_tuple("image", "json"),
-        wds.batched(8, partial=False),
+        wds.batched(32, partial=True),
     ])
     dataset = wds.DataPipeline(*pipeline)
     ds = wds.WebLoader(
@@ -198,76 +190,64 @@ def main(
     print(meta_cache)
     # create the folder if doesn't exists.
     Path(features_cache).resolve().parent.mkdir(parents=True, exist_ok=True)
-    # if os.path.exists(features_cache) and os.path.exists(meta_cache):
-    #     print("loading cached features...")
-    #     image_features = np.load(features_cache)
-    #     meta_features = np.load(meta_cache)
 
-    # else:
-    # Compute image features
     image_features_list = []
     meta_features = []
-    # count = 0
+    count = 0
     print("Computing image features...")
-    for X, meta in ds:
+    for X, meta in tqdm(ds, unit="batches"):
         file_meta = [{"tar_file": f"/data/{x['key'][:-4]}.tar",
                       "file_name": f"{x['key']}.jpg"} for x in meta]
         X = X.to(device)
-        # image_features = extract_features_batch(model, X, model_config)
+
         image_features = model(X)
         image_features = image_features.data.cpu()
         image_features = image_features.view(len(image_features), -1)
         image_features_list.append(image_features)
         meta_features.append(file_meta)
-        # count += 1
-        # if count > 8:
-        break
-    image_features = np.concatenate(image_features_list)
 
-    print("image_Features shape:", image_features.shape)
-    np.save(features_cache, image_features)
-    np.save(meta_cache, meta_features)
+        image_features = np.concatenate(image_features_list)
 
-    # Get embeddings from indexed data (i.e., LAION) that are close to the
-    # image embeddings of the dataset
-    # print(len(image_features))
-    print("Performing range search...")
-    # image_features = image_features[30_000:40_000]
-    D, I_ = image_index.search(image_features, 1)
-    print("Score:", D.mean())
-    L, D, I_ = image_index.range_search(
-        image_features, cosine_similarity_threshold)
-    # ds.transform = None
-    # ds.transforms = None
-    # print(ds[0][0])
-    # print(ds[0][1])
-    i = 0
-    # nb = 0
-    assert len(L) - 1 == len(image_features)
-    print("Start..")
-    for i in tqdm(range(len(L) - 1)):
-        indices = I_[L[i]: L[i + 1]]
-        dists = D[L[i]: L[i + 1]]
-        if len(indices):
-            # indices = indices[0:10]
-            # dists = dists[0:10]
-            order = np.argsort(-dists)
-            indices = indices[order][0:10]
-            dists = dists[order][0:10]
-            # print(dists)
-            file_meta = meta_features[0][i]
-            folder = os.path.join(out, str(Path(file_meta["file_name"]).stem))
-            # extract the original image
-            extract_file_from_tar(tar_path=file_meta["tar_file"],
-                                  file_name=file_meta["file_name"],
-                                  dest_folder=folder,
-                                  save_file_name="query_image.jpg",)
-            # get all the similar images.
-            meta_files = metadata.get_indices(indices)
-            for file_meta, dis in enumerate(meta_files, dists):
-                extract_file_from_tar(tar_path=file_meta["tar_file"],
-                                      file_name=file_meta["file_name"],
-                                      dest_folder=folder)
+        print("Performing range search...")
+
+        D, I_ = image_index.search(image_features, 1)
+        print("Score:", D.mean())
+        L, D, I_ = image_index.range_search(
+            image_features, cosine_similarity_threshold)
+
+        assert len(L) - 1 == len(image_features)
+        print("Start..")
+        for i in range(len(L) - 1):
+            indices = I_[L[i]: L[i + 1]]
+            dists = D[L[i]: L[i + 1]]
+            if len(indices):
+
+                order = np.argsort(-dists)
+                indices = indices[order][0:10]
+                dists = dists[order][0:10]
+                if dists.size > 1:
+                    count += 1
+                    print(f"count: {count}", end="\r")
+
+                    file_meta = meta_features[0][i]
+                    folder = os.path.join(
+                        out, str(Path(file_meta["file_name"]).stem))
+                    # extract the original image
+                    extract_file_from_tar(tar_path=file_meta["tar_file"],
+                                          file_name=file_meta["file_name"],
+                                          dest_folder=folder,
+                                          save_file_name="query_image.jpg")
+
+                    # get all the similar images.
+                    meta_files = metadata.get_indices(indices)
+                    for i, file_meta in enumerate(meta_files):
+                        save_file_name = f"{file_meta['file_name'][:-4]}_{str(dists[i]).replace('.','_')}_{file_meta['file_name'][-4:]}"
+                        extract_file_from_tar(tar_path=file_meta["tar_file"],
+                                              file_name=file_meta["file_name"],
+                                              dest_folder=folder,
+                                              save_file_name=save_file_name)
+        image_features_list = []
+        meta_features = []
 
         #     ds[i][0].save(f"{folder}/actual.jpg")
         #     df = pd.DataFrame(metadata.get_indices(indices))
