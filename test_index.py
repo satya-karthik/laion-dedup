@@ -1,4 +1,3 @@
-from PIL import Image
 from glob import glob
 from clize import run
 import os
@@ -10,42 +9,10 @@ import joblib
 from feature_extractor import create_model
 import webdataset as wds
 from compute_embeddings import log_and_continue
-import tarfile
 from tqdm import tqdm
-
-
-def extract_file_from_tar(tar_path: str, file_name: str,
-                          dest_folder: str, save_file_name: str = None) -> None:
-    """
-    Extracts a specific file from a tar archive and saves it to the designated folder.
-
-    Args:
-        tar_path (str): The path to the tar archive.
-        file_name (str): The name of the file to extract from the tar archive.
-        dest_folder (str): The folder where the extracted file will be saved.
-        save_file_name (str): The name of the file to be saved in the dest_folder.
-        defaults to None. if no value was provided file_name will be used.
-
-
-    Returns:
-        None
-    """
-    tar_path = Path(tar_path)
-    dest_folder = Path(dest_folder)
-
-    # Ensure destination folder exists
-    dest_folder.mkdir(parents=True, exist_ok=True)
-
-    with tarfile.open(tar_path, 'r') as tar:
-        # Extract the specified file
-        member = tar.getmember(file_name)
-        tar.extract(member, dest_folder)
-
-        # Move the extracted file to the root of the destination folder
-        if save_file_name is not None:
-            extracted_path = dest_folder / member.name
-            final_path = dest_folder / Path(save_file_name)
-            extracted_path.rename(final_path)
+import sqlite3
+from multiprocessing import Process, Queue
+from typing import List, Dict
 
 
 class MetaData:
@@ -64,30 +31,6 @@ class MetaData:
         return [self.get(ind) for ind in indices]
 
     def get(self, index):
-        # start, end, path_index = self.path_index[index]
-        # path = self.paths[path_index]
-        # data = np.load(path, allow_pickle=True)
-        # offset = index - start
-        # return data[offset]
-
-        # avg = self.cumsum[-1] / len(self.cumsum)
-        # pos = int(index // avg)
-        # while pos < len(self.cumsum) and pos >= 0:
-        # start = 0 if pos == 0 else self.cumsum[pos-1]
-        # end = self.cumsum[pos]
-        # print(index, pos, start, end)
-        # # print(pos, start, end, index)
-        # if start <= index < end:
-        # path = self.paths[pos]
-        # data = np.load(path, allow_pickle=True)
-        # offset = index - start
-        # return data[offset]
-        # elif index < start:
-        # pos -= 1
-        # else:
-        # pos += 1
-        # raise ValueError()
-        # nb = 0
         start = 0
         for path, size in zip(self.paths, self.sizes):
             end = start + size
@@ -98,24 +41,90 @@ class MetaData:
             start = end
 
 
-def expand2square(pil_img, background_color):
-    # https://note.nkmk.me/en/python-pillow-add-margin-expand-canvas/
-    width, height = pil_img.size
-    if width == height:
-        return pil_img
-    elif width > height:
-        result = Image.new(pil_img.mode, (width, width), background_color)
-        result.paste(pil_img, (0, (width - height) // 2))
-        return result
-    else:
-        result = Image.new(pil_img.mode, (height, height), background_color)
-        result.paste(pil_img, ((height - width) // 2, 0))
-        return result
+def process_images(L: np.ndarray, D: np.ndarray,
+                   I_: np.ndarray, meta_features: List[Dict],
+                   metadata: MetaData, db_name: str) -> None:
+    """Process images and store the similarities in a SQLite database.
+
+    Parameters
+    ----------
+    L : np.ndarray
+        Array of indices.
+    D : np.ndarray
+        Array of distances.
+    I_ : np.ndarray
+        Array of image identifiers.
+    meta_features : List[Dict]
+        List of metadata features for each image.
+    metadata : MetaData
+        Metadata object containing additional information about the images.
+    db_name : str
+        Name of the SQLite database file to store the results in.
+
+    Returns
+    -------
+    None
+        This function does not return a value, it only performs side effects (modifying the SQLite database).
+    """
+
+    # Connect to the database
+    with sqlite3.connect(db_name) as db:
+        cursor = db.cursor()
+
+        try:
+            # Create table if not present
+            query = '''CREATE TABLE IF NOT EXISTS image_similarities (ID INTEGER PRIMARY KEY AUTOINCREMENT, QueryImageName TEXT, SimilarImageName TEXT, SimilarityScore FLOAT)'''
+            cursor.execute(query)
+        except sqlite3.Error as e:
+            print('Error while creating the table', e)
+            return
+
+        for i in range(len(L) - 1):
+            indices = I_[L[i]: L[i + 1]]
+            dists = D[L[i]: L[i + 1]]
+            if len(indices) > 1:
+                order = np.argsort(-dists)
+                # removing the first index as it is always the same as the query image
+                indices = indices[order][1:]
+                dists = dists[order][1:]
+                # extracting the meta for query image
+                file_meta = meta_features[0][i]
+                query_image = f"{file_meta['tar_file']}/{file_meta['file_name']}"
+                # get all the similar images.
+                meta_files = metadata.get_indices(indices)
+                # change the meta_files into strings
+                similar_images = [
+                    f"{file_meta['tar_file']}/{file_meta['file_name']}" for file_meta in meta_files]
+            else:
+                # extracting the meta for query image
+                file_meta = meta_features[0][i]
+                query_image = f"{file_meta['tar_file']}/{file_meta['file_name']}"
+                similar_images = ["None"]
+                dists = [0]
+            # Add entries to table
+            for similar_image, score in zip(similar_images, dists):
+                query = f'''INSERT INTO image_similarities (QueryImageName, SimilarImageName, SimilarityScore) VALUES ("{query_image}", "{similar_image}", {score})'''
+                try:
+                    cursor.execute(query)
+                except sqlite3.Error as e:
+                    print('Error while inserting to the table', e)
+        # committing changes only after done with all the images.
+        db.commit()
+        cursor.close()
 
 
-def resize(image, tf):
-    image = tf(image)
-    return image
+def worker(q):
+    while True:
+        # Get a task from the queue
+        item = q.get()
+        if item is None:  # Use a sentinel value to indicate end of tasks
+            break
+        # these things will change based on the task being processed and function used
+        L, D, I_, meta_features, metadata, db_name = item
+        process_images(L=L, D=D, I_=I_,
+                       meta_features=meta_features,
+                       metadata=metadata,
+                       db_name=db_name)
 
 
 @torch.no_grad()
@@ -130,7 +139,7 @@ def main(
     batch_size=128,
     num_workers=4,
     model_config="dedup_seer1.5B.th",
-    out="/output/results/exp_9_t_0_604169",
+    out="/output/results/exp_010_t_0_604169",
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # dataset_slug = dataset_name.replace("/", "_")
@@ -193,8 +202,26 @@ def main(
 
     image_features_list = []
     meta_features = []
-    count = 0
-    print("Computing image features...")
+    # count = 0
+
+    # Create a new queue
+    queue = Queue()
+    db_path = Path(out) / "test.db"
+    if db_path.exists():
+        # remove it using Pathlib
+        db_path.unlink()
+    db_name = str(db_path)
+
+    # Create worker processes
+    # Choose a number based on the number of cores in your machine
+    num_workers = 4
+    processes = []
+    for _ in range(num_workers):
+        p = Process(target=worker, args=(queue,))
+        processes.append(p)
+        p.start()
+
+    print("started finding similar images...")
     for X, meta in tqdm(ds, unit="batches"):
         file_meta = [{"tar_file": f"/data/{x['key'][:-4]}.tar",
                       "file_name": f"{x['key']}.jpg"} for x in meta]
@@ -208,56 +235,27 @@ def main(
 
         image_features = np.concatenate(image_features_list)
 
-        print("Performing range search...")
+        # print("Performing range search...")
 
         D, I_ = image_index.search(image_features, 1)
-        print("Score:", D.mean())
+        # print("Score:", D.mean())
         L, D, I_ = image_index.range_search(
             image_features, cosine_similarity_threshold)
 
-        assert len(L) - 1 == len(image_features)
-        print("Start..")
-        for i in range(len(L) - 1):
-            indices = I_[L[i]: L[i + 1]]
-            dists = D[L[i]: L[i + 1]]
-            if len(indices):
+        # this should be submitted to the worker processes
 
-                order = np.argsort(-dists)
-                indices = indices[order][0:10]
-                dists = dists[order][0:10]
-                if dists.size > 1:
-                    count += 1
-                    print(f"count: {count}", end="\r")
+        queue.put((L, D, I_, meta_features, metadata, db_name))
 
-                    file_meta = meta_features[0][i]
-                    folder = os.path.join(
-                        out, str(Path(file_meta["file_name"]).stem))
-                    # extract the original image
-                    extract_file_from_tar(tar_path=file_meta["tar_file"],
-                                          file_name=file_meta["file_name"],
-                                          dest_folder=folder,
-                                          save_file_name="query_image.jpg")
-
-                    # get all the similar images.
-                    meta_files = metadata.get_indices(indices)
-                    for i, file_meta in enumerate(meta_files):
-                        save_file_name = f"{file_meta['file_name'][:-4]}_{str(dists[i]).replace('.','_')}_{file_meta['file_name'][-4:]}"
-                        extract_file_from_tar(tar_path=file_meta["tar_file"],
-                                              file_name=file_meta["file_name"],
-                                              dest_folder=folder,
-                                              save_file_name=save_file_name)
         image_features_list = []
         meta_features = []
 
-        #     ds[i][0].save(f"{folder}/actual.jpg")
-        #     df = pd.DataFrame(metadata.get_indices(indices))
-        #     df = df[["url"]]
-        #     df["distance"] = dists
-        #     df.to_csv(f"{folder}/dup.csv", index=False)
-        #     # url = df.url.values[0]
-        #     nb += 1
-        #     print(nb, len(ds))
-        # print(i)
+    # Tell worker processes to stop when no more tasks are left
+    for _ in range(num_workers):
+        queue.put(None)
+
+    # Wait for all of the workers to finish
+    for p in processes:
+        p.join()
 
 
 if __name__ == "__main__":
